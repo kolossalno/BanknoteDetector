@@ -12,7 +12,7 @@ import androidx.core.content.ContextCompat
 import java.util.LinkedList
 import kotlin.math.max
 
-class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs) {
+class  OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs) {
 
     private var results = listOf<BoundingBox>()
     private var boxPaint = Paint()
@@ -51,27 +51,104 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
     override fun draw(canvas: Canvas) {
         super.draw(canvas)
 
+        // Стиль уголков-видоискателей
+        boxPaint.color = Color.parseColor("#00E676") // Изумрудно-зеленый
+        boxPaint.strokeWidth = 10f
+        boxPaint.style = Paint.Style.STROKE
+        boxPaint.strokeCap = Paint.Cap.ROUND
+        boxPaint.isAntiAlias = true
+
+        // Стиль фона плашки
+        textBackgroundPaint.color = Color.parseColor("#CC121212") // Полупрозрачный черный
+        textBackgroundPaint.style = Paint.Style.FILL
+        textBackgroundPaint.isAntiAlias = true
+
+        // Стиль текста
+        textPaint.color = Color.WHITE
+        textPaint.textSize = 46f
+        textPaint.isFakeBoldText = true
+        textPaint.isAntiAlias = true
+
+        // Индикатор-точка на плашке
+        val dotPaint = Paint().apply {
+            color = Color.parseColor("#00E676")
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+
         results.forEach {
             val left = it.x1 * width
             val top = it.y1 * height
             val right = it.x2 * width
             val bottom = it.y2 * height
 
-            canvas.drawRect(left, top, right, bottom, boxPaint)
-            val drawableText = it.clsName
+            val boxWidth = right - left
+            val boxHeight = bottom - top
+            val cornerLen = minOf(boxWidth, boxHeight, 350f) * 0.22f
 
-            textBackgroundPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
+            // 1. Рисуем 4 уголка-видоискателя
+            // Левый верхний
+            canvas.drawLine(left, top, left + cornerLen, top, boxPaint)
+            canvas.drawLine(left, top, left, top + cornerLen, boxPaint)
+
+            // Правый верхний
+            canvas.drawLine(right - cornerLen, top, right, top, boxPaint)
+            canvas.drawLine(right, top, right, top + cornerLen, boxPaint)
+
+            // Левый нижний
+            canvas.drawLine(left, bottom - cornerLen, left, bottom, boxPaint)
+            canvas.drawLine(left, bottom, left + cornerLen, bottom, boxPaint)
+
+            // Правый нижний
+            canvas.drawLine(right - cornerLen, bottom, right, bottom, boxPaint)
+            canvas.drawLine(right, bottom - cornerLen, right, bottom, boxPaint)
+
+            // 2. Красивое название и процент уверенности
+            val prettyName = when (it.clsName) {
+                "1000" -> "1000 ГМИ"
+                "5" -> "5 ГМИ"
+                else -> it.clsName
+            }
+            val confidencePercent = (it.cnf * 100).toInt()
+            val drawableText = "$prettyName • $confidencePercent%"
+
+            textPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
             val textWidth = bounds.width()
             val textHeight = bounds.height()
-            canvas.drawRect(
-                left,
-                top,
-                left + textWidth + BOUNDING_RECT_TEXT_PADDING,
-                top + textHeight + BOUNDING_RECT_TEXT_PADDING,
-                textBackgroundPaint
-            )
-            canvas.drawText(drawableText, left, top + bounds.height(), textPaint)
 
+            val paddingH = 26f
+            val paddingV = 16f
+            val badgeHeight = textHeight + paddingV * 2
+            val badgeWidth = textWidth + paddingH * 2 + 12f
+
+            // Защита от выхода плашки за верхний или правый край экрана
+            val badgeTop = if (top - badgeHeight - 12f > 0f) {
+                top - badgeHeight - 12f
+            } else {
+                top + 12f
+            }
+            val badgeLeft = left.coerceAtMost((width - badgeWidth).coerceAtLeast(0f))
+            val badgeBottom = badgeTop + badgeHeight
+
+            // 3. Скругленная плашка-бейдж
+            val badgeRect = android.graphics.RectF(
+                badgeLeft,
+                badgeTop,
+                badgeLeft + badgeWidth,
+                badgeBottom
+            )
+            canvas.drawRoundRect(badgeRect, 16f, 16f, textBackgroundPaint)
+
+            // Зеленая точка-индикатор слева
+            canvas.drawCircle(badgeLeft + 18f, badgeTop + badgeHeight / 2f, 6f, dotPaint)
+
+            // 4. Текст номинала
+            canvas.drawText(
+                drawableText,
+                badgeLeft + paddingH + 8f,
+                badgeBottom - paddingV,
+                textPaint
+            )
         }
     }
 

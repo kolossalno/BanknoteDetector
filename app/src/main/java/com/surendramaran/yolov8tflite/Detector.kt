@@ -3,6 +3,7 @@ package com.surendramaran.yolov8tflite
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
+import android.util.Log
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -39,15 +40,8 @@ class Detector(
         .build()
 
     init {
-        val compatList = CompatibilityList()
-
-        val options = Interpreter.Options().apply{
-            if(compatList.isDelegateSupportedOnThisDevice){
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                this.addDelegate(GpuDelegate(delegateOptions))
-            } else {
-                this.setNumThreads(4)
-            }
+        val options = Interpreter.Options().apply {
+            this.setNumThreads(4)
         }
 
         val model = FileUtil.loadMappedFile(context, modelPath)
@@ -56,11 +50,12 @@ class Detector(
         val inputShape = interpreter.getInputTensor(0)?.shape()
         val outputShape = interpreter.getOutputTensor(0)?.shape()
 
+        Log.d("Detector", "Input shape: ${inputShape?.contentToString()}, Output shape: ${outputShape?.contentToString()}")
+
         if (inputShape != null) {
             tensorWidth = inputShape[1]
             tensorHeight = inputShape[2]
 
-            // If in case input shape is in format of [1, 3, ..., ...]
             if (inputShape[1] == 3) {
                 tensorWidth = inputShape[2]
                 tensorHeight = inputShape[3]
@@ -77,13 +72,14 @@ class Detector(
             val reader = BufferedReader(InputStreamReader(inputStream))
 
             var line: String? = reader.readLine()
-            while (line != null && line != "") {
-                labels.add(line)
+            while (line != null && line.isNotBlank()) {
+                labels.add(line.trim())
                 line = reader.readLine()
             }
 
             reader.close()
             inputStream.close()
+            Log.d("Detector", "Loaded labels: $labels")
         } catch (e: IOException) {
             e.printStackTrace()
         }
@@ -94,8 +90,8 @@ class Detector(
 
         val options = if (isGpu) {
             val compatList = CompatibilityList()
-            Interpreter.Options().apply{
-                if(compatList.isDelegateSupportedOnThisDevice){
+            Interpreter.Options().apply {
+                if (compatList.isDelegateSupportedOnThisDevice) {
                     val delegateOptions = compatList.bestOptionsForThisDevice
                     this.addDelegate(GpuDelegate(delegateOptions))
                 } else {
@@ -103,7 +99,7 @@ class Detector(
                 }
             }
         } else {
-            Interpreter.Options().apply{
+            Interpreter.Options().apply {
                 this.setNumThreads(4)
             }
         }
@@ -117,19 +113,38 @@ class Detector(
     }
 
     fun detect(frame: Bitmap) {
-        if (tensorWidth == 0) return
-        if (tensorHeight == 0) return
-        if (numChannel == 0) return
-        if (numElements == 0) return
+        if (tensorWidth == 0 || tensorHeight == 0 || numChannel == 0 || numElements == 0) return
 
         var inferenceTime = SystemClock.uptimeMillis()
 
         val resizedBitmap = Bitmap.createScaledBitmap(frame, tensorWidth, tensorHeight, false)
 
-        val tensorImage = TensorImage(INPUT_IMAGE_TYPE)
-        tensorImage.load(resizedBitmap)
-        val processedImage = imageProcessor.process(tensorImage)
-        val imageBuffer = processedImage.buffer
+        val isNCHW = interpreter.getInputTensor(0)?.shape()?.get(1) == 3
+        val imageBuffer = if (isNCHW) {
+            // Укладываем пиксели в формат [1, 3, 416, 416] (NCHW)
+            val buffer = java.nio.ByteBuffer.allocateDirect(4 * 3 * tensorWidth * tensorHeight)
+            buffer.order(java.nio.ByteOrder.nativeOrder())
+            val intValues = IntArray(tensorWidth * tensorHeight)
+            resizedBitmap.getPixels(intValues, 0, tensorWidth, 0, 0, tensorWidth, tensorHeight)
+
+            val channelSize = tensorWidth * tensorHeight
+            for (i in 0 until channelSize) {
+                val pixel = intValues[i]
+                // R канал
+                buffer.putFloat(0 * 4 + i * 4, ((pixel shr 16) and 0xFF) / 255.0f)
+                // G канал
+                buffer.putFloat(channelSize * 4 + i * 4, ((pixel shr 8) and 0xFF) / 255.0f)
+                // B канал
+                buffer.putFloat(2 * channelSize * 4 + i * 4, (pixel and 0xFF) / 255.0f)
+            }
+            buffer.rewind()
+            buffer
+        } else {
+            // Стандартный формат [1, 416, 416, 3] (NHWC)
+            val tensorImage = TensorImage(INPUT_IMAGE_TYPE)
+            tensorImage.load(resizedBitmap)
+            imageProcessor.process(tensorImage).buffer
+        }
 
         val output = TensorBuffer.createFixedSize(intArrayOf(1, numChannel, numElements), OUTPUT_IMAGE_TYPE)
         interpreter.run(imageBuffer, output.buffer)
@@ -145,8 +160,7 @@ class Detector(
         detectorListener.onDetect(bestBoxes, inferenceTime)
     }
 
-    private fun bestBox(array: FloatArray) : List<BoundingBox>? {
-
+    private fun bestBox(array: FloatArray): List<BoundingBox>? {
         val boundingBoxes = mutableListOf<BoundingBox>()
 
         for (c in 0 until numElements) {
@@ -154,7 +168,8 @@ class Detector(
             var maxIdx = -1
             var j = 4
             var arrayIdx = c + numElements * j
-            while (j < numChannel){
+
+            while (j < numChannel) {
                 if (array[arrayIdx] > maxConf) {
                     maxConf = array[arrayIdx]
                     maxIdx = j - 4
@@ -163,20 +178,27 @@ class Detector(
                 arrayIdx += numElements
             }
 
-            if (maxConf > CONFIDENCE_THRESHOLD) {
+            if (maxConf > CONFIDENCE_THRESHOLD && maxIdx in labels.indices) {
                 val clsName = labels[maxIdx]
-                val cx = array[c] // 0
-                val cy = array[c + numElements] // 1
-                val w = array[c + numElements * 2]
-                val h = array[c + numElements * 3]
-                val x1 = cx - (w/2F)
-                val y1 = cy - (h/2F)
-                val x2 = cx + (w/2F)
-                val y2 = cy + (h/2F)
-                if (x1 < 0F || x1 > 1F) continue
-                if (y1 < 0F || y1 > 1F) continue
-                if (x2 < 0F || x2 > 1F) continue
-                if (y2 < 0F || y2 > 1F) continue
+                var cx = array[c]
+                var cy = array[c + numElements]
+                var w = array[c + numElements * 2]
+                var h = array[c + numElements * 3]
+
+                // Нормализуем пиксельные координаты (0..416) в диапазон (0..1)
+                if (cx > 1.5F || cy > 1.5F || w > 1.5F || h > 1.5F) {
+                    cx /= tensorWidth.toFloat()
+                    cy /= tensorHeight.toFloat()
+                    w /= tensorWidth.toFloat()
+                    h /= tensorHeight.toFloat()
+                }
+
+                val x1 = (cx - (w / 2F)).coerceIn(0F, 1F)
+                val y1 = (cy - (h / 2F)).coerceIn(0F, 1F)
+                val x2 = (cx + (w / 2F)).coerceIn(0F, 1F)
+                val y2 = (cy + (h / 2F)).coerceIn(0F, 1F)
+
+                if (x2 <= x1 || y2 <= y1) continue
 
                 boundingBoxes.add(
                     BoundingBox(
@@ -193,11 +215,11 @@ class Detector(
         return applyNMS(boundingBoxes)
     }
 
-    private fun applyNMS(boxes: List<BoundingBox>) : MutableList<BoundingBox> {
+    private fun applyNMS(boxes: List<BoundingBox>): MutableList<BoundingBox> {
         val sortedBoxes = boxes.sortedByDescending { it.cnf }.toMutableList()
         val selectedBoxes = mutableListOf<BoundingBox>()
 
-        while(sortedBoxes.isNotEmpty()) {
+        while (sortedBoxes.isNotEmpty()) {
             val first = sortedBoxes.first()
             selectedBoxes.add(first)
             sortedBoxes.remove(first)
@@ -236,7 +258,7 @@ class Detector(
         private const val INPUT_STANDARD_DEVIATION = 255f
         private val INPUT_IMAGE_TYPE = DataType.FLOAT32
         private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
-        private const val CONFIDENCE_THRESHOLD = 0.3F
+        private const val CONFIDENCE_THRESHOLD = 0.60F
         private const val IOU_THRESHOLD = 0.5F
     }
 }
